@@ -35,6 +35,7 @@
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { PDFDocument, rgb, StandardFonts } from "https://esm.sh/pdf-lib@1.17.1";
 
 // ── ENV VARIABLES ─────────────────────────────────────────────────────────────
 const SB_URL = Deno.env.get("SB_URL")!;
@@ -43,6 +44,15 @@ const CLAUDE_API_KEY = Deno.env.get("CLAUDE_API_KEY")!;
 const WHATSAPP_TOKEN = Deno.env.get("WHATSAPP_TOKEN")!;
 const WHATSAPP_PHONE_NUMBER_ID = Deno.env.get("WHATSAPP_PHONE_NUMBER_ID")!;
 const OWNER_WHATSAPP = Deno.env.get("OWNER_WHATSAPP")!;
+const GMAIL_APP_PASSWORD = Deno.env.get("GMAIL_APP_PASSWORD")!;
+const GMAIL_SENDER_EMAIL = Deno.env.get("GMAIL_SENDER_EMAIL")!;
+
+// Brand colours (RGB 0-1 scale for pdf-lib)
+const COLOR_NAVY = rgb(0.035, 0.239, 0.447); // #093D72
+const COLOR_LIGHT_BLUE = rgb(0.922, 0.957, 0.992); // #EBF4FD
+const COLOR_WHITE = rgb(1, 1, 1);
+const COLOR_BLACK = rgb(0.1, 0.1, 0.1);
+const COLOR_GREY = rgb(0.4, 0.4, 0.4);
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -272,12 +282,411 @@ async function generateReportWithClaude(prompt: string): Promise<string> {
   return data.content[0].text.trim();
 }
 
+// ── PHASE 2: REPORT APPROVAL + FINAL PDF SEND ───────────────────────────────────
+//
+// Triggered when the owner approves a report draft in the app.
+//
+// Expected POST body:
+// { "report_id": "uuid-of-the-report" }
+//
+// Sends the final branded PDF to the client and/or developer, based on
+// job.report_recipient ("Client" | "Developer" | "Both"). Defaults to
+// "Client" if not set.
+
+/**
+ * Fetch a report row by id
+ */
+async function fetchReport(reportId: string): Promise<any> {
+  const res = await fetch(
+    `${SB_URL}/rest/v1/reports?id=eq.${reportId}&limit=1`,
+    {
+      headers: {
+        apikey: SB_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SB_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+
+  if (!res.ok) throw new Error("Failed to fetch report");
+
+  const rows = await res.json();
+  return rows.length > 0 ? rows[0] : null;
+}
+
+/**
+ * Update report status (and optionally sent_at / recipient_summary) after send
+ */
+async function updateReportStatus(
+  reportId: string,
+  status: string,
+  recipientSummary: string
+): Promise<void> {
+  const res = await fetch(`${SB_URL}/rest/v1/reports?id=eq.${reportId}`, {
+    method: "PATCH",
+    headers: {
+      apikey: SB_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SB_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      status: status,
+      sent_at: new Date().toISOString(),
+      recipient_summary: recipientSummary,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    console.error("[Jabiru] ⚠️ Failed to update report status (non-fatal):", err);
+  }
+}
+
+/**
+ * Word-wrap a single line of text to fit within maxWidth at the given font/size
+ */
+function wrapLine(
+  line: string,
+  font: any,
+  size: number,
+  maxWidth: number
+): string[] {
+  if (line.trim() === "") return [""];
+  const words = line.split(" ");
+  const wrapped: string[] = [];
+  let current = "";
+  for (const word of words) {
+    const test = current ? `${current} ${word}` : word;
+    if (font.widthOfTextAtSize(test, size) > maxWidth && current) {
+      wrapped.push(current);
+      current = word;
+    } else {
+      current = test;
+    }
+  }
+  if (current) wrapped.push(current);
+  return wrapped.length ? wrapped : [""];
+}
+
+/**
+ * Generate the final branded, paginated PDF for an inspection report.
+ */
+async function generateReportPdf(job: any, reportContent: string, reportRef: string): Promise<Uint8Array> {
+  const pdfDoc = await PDFDocument.create();
+  const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const pageWidth = 595.28;
+  const pageHeight = 841.89;
+  const marginX = 40;
+  const contentWidth = pageWidth - marginX * 2;
+  const bodyFontSize = 9.5;
+  const lineHeight = 13;
+
+  function drawHeader(page: any, isFirstPage: boolean): number {
+    const headerHeight = isFirstPage ? 90 : 50;
+    page.drawRectangle({
+      x: 0, y: pageHeight - headerHeight, width: pageWidth, height: headerHeight, color: COLOR_NAVY,
+    });
+    page.drawText("Jabiru Ventures", {
+      x: marginX, y: pageHeight - 35, size: isFirstPage ? 20 : 14, font: fontBold, color: COLOR_WHITE,
+    });
+    if (isFirstPage) {
+      page.drawText("BEM-Certified Property Inspectors — Inspection Report", {
+        x: marginX, y: pageHeight - 55, size: 10, font: fontRegular, color: COLOR_LIGHT_BLUE,
+      });
+      page.drawText(`Report Ref: ${reportRef}`, {
+        x: marginX, y: pageHeight - 72, size: 9, font: fontRegular, color: COLOR_LIGHT_BLUE,
+      });
+    }
+    return pageHeight - headerHeight - 25;
+  }
+
+  const rawLines = reportContent.split("\n");
+  const allLines: string[] = [];
+  for (const raw of rawLines) {
+    allLines.push(...wrapLine(raw, fontRegular, bodyFontSize, contentWidth));
+  }
+
+  let pageNum = 1;
+  let page = pdfDoc.addPage([pageWidth, pageHeight]);
+  let y = drawHeader(page, true);
+
+  for (const line of allLines) {
+    if (y < 60) {
+      page.drawText(`Page ${pageNum}`, { x: pageWidth - 80, y: 30, size: 8, font: fontRegular, color: COLOR_GREY });
+      page = pdfDoc.addPage([pageWidth, pageHeight]);
+      pageNum++;
+      y = drawHeader(page, false);
+    }
+    page.drawText(line, { x: marginX, y, size: bodyFontSize, font: fontRegular, color: COLOR_BLACK });
+    y -= lineHeight;
+  }
+  page.drawText(`Page ${pageNum}`, { x: pageWidth - 80, y: 30, size: 8, font: fontRegular, color: COLOR_GREY });
+
+  return await pdfDoc.save();
+}
+
+/**
+ * Upload PDF to Supabase Storage "reports" bucket and return a public URL.
+ */
+async function uploadReportPdfToStorage(pdfBytes: Uint8Array, fileName: string): Promise<string> {
+  const res = await fetch(`${SB_URL}/storage/v1/object/reports/${fileName}`, {
+    method: "POST",
+    headers: {
+      apikey: SB_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SB_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/pdf",
+      "x-upsert": "true",
+    },
+    body: pdfBytes,
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Failed to upload report PDF to storage: ${err}`);
+  }
+
+  return `${SB_URL}/storage/v1/object/public/reports/${fileName}`;
+}
+
+/**
+ * Send the report PDF via WhatsApp as a document attachment.
+ */
+async function sendReportWhatsAppDocument(
+  to: string,
+  pdfUrl: string,
+  fileName: string,
+  caption: string
+): Promise<void> {
+  const res = await fetch(
+    `https://graph.facebook.com/v18.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: to,
+        type: "document",
+        document: { link: pdfUrl, filename: fileName, caption: caption },
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`WhatsApp document send failed: ${err}`);
+  }
+}
+
+/**
+ * Email the final report PDF to a recipient via Gmail SMTP.
+ */
+async function sendReportEmail(
+  toEmail: string,
+  recipientName: string,
+  pdfBytes: Uint8Array,
+  fileName: string,
+  reportRef: string,
+  job: any
+): Promise<void> {
+  const { SMTPClient } = await import("https://deno.land/x/denomailer@1.6.0/mod.ts");
+
+  const client = new SMTPClient({
+    connection: {
+      hostname: "smtp.gmail.com",
+      port: 465,
+      tls: true,
+      auth: { username: GMAIL_SENDER_EMAIL, password: GMAIL_APP_PASSWORD },
+    },
+  });
+
+  const base64Pdf = btoa(String.fromCharCode(...pdfBytes));
+
+  await client.send({
+    from: GMAIL_SENDER_EMAIL,
+    to: toEmail,
+    subject: `Jabiru Ventures Inspection Report ${reportRef}`,
+    content: `Dear ${recipientName},\n\nPlease find attached the final inspection report for the property at ${job.properties?.address || "the inspected property"}.\n\nReference: ${reportRef}\n\nThank you for choosing Jabiru Ventures.\n\nBest regards,\nJabiru Ventures`,
+    attachments: [{ filename: fileName, content: base64Pdf, encoding: "base64" }],
+  });
+
+  await client.close();
+}
+
+/**
+ * Handle the report approval + final send trigger.
+ */
+async function handleReportApproval(body: any): Promise<Response> {
+  const { report_id } = body;
+
+  if (!report_id) {
+    return new Response(
+      JSON.stringify({ error: "report_id is required" }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // ── Fetch report + job ─────────────────────────────────────────────────
+  let report: any;
+  try {
+    report = await fetchReport(report_id);
+    if (!report) {
+      return new Response(
+        JSON.stringify({ error: "Report not found" }),
+        { status: 404, headers: { "Content-Type": "application/json" } }
+      );
+    }
+  } catch (err) {
+    console.error("[Jabiru] ❌ Failed to fetch report:", err);
+    return new Response(
+      JSON.stringify({ error: "Failed to fetch report" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  let job: any;
+  try {
+    job = await fetchJobDetails(report.job_id);
+    if (!job) {
+      return new Response(
+        JSON.stringify({ error: "Job not found for this report" }),
+        { status: 404, headers: { "Content-Type": "application/json" } }
+      );
+    }
+  } catch (err) {
+    console.error("[Jabiru] ❌ Failed to fetch job:", err);
+    return new Response(
+      JSON.stringify({ error: "Failed to fetch job details" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const reportRef = `${job.invoice_no}-RPT`;
+  const fileName = `${reportRef}.pdf`;
+
+  // ── Generate PDF ──────────────────────────────────────────────────────
+  let pdfBytes: Uint8Array;
+  try {
+    pdfBytes = await generateReportPdf(job, report.content, reportRef);
+    console.log("[Jabiru] ✅ Final report PDF generated");
+  } catch (err) {
+    console.error("[Jabiru] ❌ Report PDF generation failed:", err);
+    return new Response(
+      JSON.stringify({ error: "Failed to generate report PDF" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // ── Upload PDF ────────────────────────────────────────────────────────
+  let pdfUrl = "";
+  try {
+    pdfUrl = await uploadReportPdfToStorage(pdfBytes, fileName);
+    console.log(`[Jabiru] ✅ Report PDF uploaded: ${pdfUrl}`);
+  } catch (err) {
+    console.error("[Jabiru] ❌ Report PDF upload failed:", err);
+    // Continue — email can still be sent without the public URL
+  }
+
+  // ── Determine recipients from job.report_recipient ───────────────────
+  const recipientPref = (job.report_recipient || "Client").toLowerCase();
+  const sendToClient = recipientPref.includes("client") || recipientPref.includes("both");
+  const sendToDeveloper = recipientPref.includes("developer") || recipientPref.includes("both");
+
+  const customer = job.customers;
+  const property = job.properties;
+  const sentTo: string[] = [];
+  const skipped: string[] = [];
+
+  if (sendToClient) {
+    const caption = `Final Inspection Report — ${reportRef}\nJabiru Ventures`;
+    if (customer?.phone && pdfUrl) {
+      try {
+        await sendReportWhatsAppDocument(customer.phone, pdfUrl, fileName, caption);
+        sentTo.push(`client WhatsApp (${customer.phone})`);
+      } catch (err) {
+        console.error("[Jabiru] ❌ Client WhatsApp send failed:", err);
+        skipped.push(`client WhatsApp failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      skipped.push("client WhatsApp (missing phone or PDF URL)");
+    }
+
+    if (customer?.email) {
+      try {
+        await sendReportEmail(customer.email, customer.full_name || "Valued Customer", pdfBytes, fileName, reportRef, job);
+        sentTo.push(`client email (${customer.email})`);
+      } catch (err) {
+        console.error("[Jabiru] ❌ Client email send failed:", err);
+        skipped.push(`client email failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      skipped.push("client email (no email on file)");
+    }
+  }
+
+  if (sendToDeveloper) {
+    if (property?.developer_email) {
+      try {
+        await sendReportEmail(property.developer_email, property.developer || "Developer", pdfBytes, fileName, reportRef, job);
+        sentTo.push(`developer email (${property.developer_email})`);
+      } catch (err) {
+        console.error("[Jabiru] ❌ Developer email send failed:", err);
+        skipped.push(`developer email failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      skipped.push("developer email (no developer_email on file for this property)");
+    }
+  }
+
+  // ── Update report status ─────────────────────────────────────────────
+  const recipientSummary = sentTo.length > 0 ? sentTo.join(", ") : "none — see skipped";
+  try {
+    await updateReportStatus(report_id, "Sent", recipientSummary);
+    console.log("[Jabiru] ✅ Report status updated to Sent");
+  } catch (err) {
+    console.error("[Jabiru] ⚠️ Failed to update report status (non-fatal):", err);
+  }
+
+  // ── Notify owner ──────────────────────────────────────────────────────
+  const ownerMessage =
+    `✅ Final report sent!\n\n` +
+    `🔖 Job: ${job.invoice_no}\n` +
+    `👤 Client: ${customer?.full_name || "N/A"}\n` +
+    `📤 Sent to: ${sentTo.length > 0 ? sentTo.join(", ") : "no one — check for missing contact info"}` +
+    (skipped.length > 0 ? `\n⚠️ Skipped: ${skipped.join(", ")}` : "");
+
+  try {
+    await sendWhatsApp(OWNER_WHATSAPP, ownerMessage);
+    console.log("[Jabiru] ✅ Owner notified of final report send");
+  } catch (err) {
+    console.error("[Jabiru] ❌ Failed to notify owner:", err);
+  }
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      report_id: report_id,
+      report_ref: reportRef,
+      pdf_url: pdfUrl || null,
+      sent_to: sentTo,
+      skipped: skipped,
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } }
+  );
+}
+
 // ── MAIN HANDLER ──────────────────────────────────────────────────────────────
 
 serve(async (req: Request) => {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
+
+  const url = new URL(req.url);
+  const path = url.pathname;
 
   // ── Parse request body ───────────────────────────────────────────────────
   let body: any;
@@ -288,6 +697,11 @@ serve(async (req: Request) => {
       JSON.stringify({ error: "Invalid JSON body" }),
       { status: 400, headers: { "Content-Type": "application/json" } }
     );
+  }
+
+  // Route: /report-generator/approve (Phase 2: approve + final PDF send)
+  if (path.endsWith("approve")) {
+    return await handleReportApproval(body);
   }
 
   const { job_id, checklist } = body;
