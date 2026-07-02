@@ -24,7 +24,7 @@
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { PDFDocument, rgb, StandardFonts } from "https://cdn.skypack.dev/pdf-lib@1.17.1";
+import { PDFDocument, rgb, StandardFonts } from "https://esm.sh/pdf-lib@1.17.1";
 
 // ── ENV VARIABLES ─────────────────────────────────────────────────────────────
 const SB_URL = Deno.env.get("SB_URL")!;
